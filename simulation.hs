@@ -27,22 +27,33 @@ frameSteps = 6
 stepDelta :: H.Time
 stepDelta = framePeriod / (fromIntegral frameSteps)
 
+worldSize :: Dimension
+worldSize = (1200, 800)
+
+(|+|) :: H.CpFloat -> H.CpFloat -> H.Vector
+(|+|) = H.Vector
+infix 4 |+|
+
+-- An object in the simulation world
 data Object  = O H.Body [(H.Shape, H.ShapeType)]
   deriving (Eq)
 
 instance Ord Object where
   compare (O b1 _) (O b2 _) = compare b1 b2
 
+-- Information about collisions
 type Collision = (H.Position
                  ,Double -- Relative velocity of collision
                  )
 
-data SimST = SimST {stDimension :: Dimension
-                   ,stSpace :: H.Space
+-- Main state maintained for simulations
+data SimST = SimST {stDimension :: Dimension           -- World size
+                   ,stSpace :: H.Space                 -- Space object from Hipmunk
                    ,stObjects :: M.Map Object (IO ())  -- IO Action to remove the object
-                   ,stCollisions :: IORef [Collision] -- Collisions detected during last step
+                   ,stCollisions :: IORef [Collision]  -- Collisions detected during last advance
                    }
 
+-- Builds a new default simST with specified world size
 newSimST :: Dimension -> IO SimST
 newSimST (w, h) = do space <- H.newSpace
                      H.gravity space S.$= 0 |+| -230
@@ -55,8 +66,8 @@ newSimST (w, h) = do space <- H.newSpace
                      H.position ground S.$= w2 |+| 0
                      H.spaceAdd space (H.Static groundshape)
 
-                     let lineobj = O ground [(groundshape, groundShapeType)]
-                     let objs = M.insert lineobj (return ()) M.empty
+                     let groundobj = O ground [(groundshape, groundShapeType)]
+                     let objs = M.insert groundobj (H.spaceRemove space groundshape) M.empty
 
                      collisions <- newIORef []
                      let handler = do ps <- H.points
@@ -66,17 +77,21 @@ newSimST (w, h) = do space <- H.newSpace
                                       v1 <- liftIO $ S.get $ H.velocity b1
                                       v2 <- liftIO $ S.get $ H.velocity b2
                                       liftIO $ modifyIORef collisions ((head ps, abs $ H.len $ v2-v1):)
+
                      H.setDefaultCollisionHandler space $
                        H.Handler {H.beginHandler = Nothing
                                  ,H.preSolveHandler = Nothing
                                  ,H.postSolveHandler = Just handler
                                  ,H.separateHandler = Nothing
                                  }
+
                      return $ SimST (w, h) space objs collisions
 
+-- Destroys a simST and frees its resources
 destroySimST :: SimST -> IO ()
 destroySimST st = H.freeSpace $ stSpace st
 
+-- Specification of a ball object
 data BallDef = BallDef {ballPos::H.Position
                        ,ballRadius::H.Distance
                        ,ballElasticity::H.Elasticity
@@ -84,8 +99,9 @@ data BallDef = BallDef {ballPos::H.Position
                        ,ballMoment::H.Moment
                        }
 
-addBall :: SEvent BallDef -> S.StateVar SimST -> IO (S.StateVar SimST)
-addBall (Just (BallDef pos radius elasticity mass minertia)) st = do
+-- Adds a ball given a BallDef to the simST
+addBall :: BallDef -> S.StateVar SimST -> IO (S.StateVar SimST)
+addBall (BallDef pos radius elasticity mass minertia) st = do
   st' <- S.get st
   ball <- H.newBody mass minertia
   let ballshapetype = (H.Circle radius)
@@ -103,7 +119,11 @@ addBall (Just (BallDef pos radius elasticity mass minertia)) st = do
 
   st S.$= st'{stObjects=objs'}
   return st
-addBall Nothing st = return st
+
+-- Decorated function for UISF
+uisfAddBall :: SEvent BallDef -> S.StateVar SimST -> IO (S.StateVar SimST)
+uisfAddBall (Just bd) st = addBall bd st
+uisfAddBall _ st = return st
 
 extractCollision :: S.StateVar SimST -> IO [Collision]
 extractCollision st = do
@@ -115,6 +135,7 @@ extractCollision st = do
 class Simulatable a where
   advance :: S.StateVar a -> IO ()
 
+-- Removes objects that are out of the visible boundary
 removeOutOfSight :: S.StateVar SimST -> IO ()
 removeOutOfSight st = 
   do st' <- S.get st
@@ -132,10 +153,8 @@ removeOutOfSight st =
 instance Simulatable SimST where
   advance st = do removeOutOfSight st
                   st' <- S.get st
-                  let clearCollisions = writeIORef (stCollisions st') []
-                      step = H.step (stSpace st') stepDelta
+                  let step = H.step (stSpace st') stepDelta
                   replicateM_ (frameSteps) (step)
-                  --step
 
 
 {-
@@ -163,12 +182,9 @@ instance Simulatable SimST where
  - (0, 0) ---------> x grows
  -}
 
+-- Convert a point between UISF and Hipmunk coordinate systems
 convCoord :: Dimension -> Point -> Point
 convCoord (_, h) (x, y) = (x, h-y)
-
-(|+|) :: H.CpFloat -> H.CpFloat -> H.Vector
-(|+|) = H.Vector
-infix 4 |+|
 
 class Drawable a where
   draw :: a -> H.Position -> Rect -> Graphic
@@ -198,28 +214,26 @@ instance Drawable Object where
                                 undefined
             in  graphic
 
-type WState = [(Object, H.Position)] -- Position for each object in Hipmunk coordinates
+-- Position for each object in Hipmunk coordinates
+type WState = [(Object, H.Position)]
 
-worldSize :: Dimension
-worldSize = (1200, 800)
+presentALayout :: Layout
+presentALayout = makeLayout (Fixed $ fst worldSize) (Fixed $ snd worldSize)
 
-wLayout :: Layout
-wLayout = makeLayout (Fixed $ fst worldSize) (Fixed $ snd worldSize)
+presentACompute :: WState -> WState -> Rect -> UIEvent -> ((), WState, DirtyBit)
+presentACompute input st _ _ = ((), input, input /= st)
 
-wCompute :: WState -> WState -> Rect -> UIEvent -> ((), WState, DirtyBit)
-wCompute input st _ _ = ((), input, input /= st)
-
-wDraw :: Rect -> Bool -> WState -> Graphic
-wDraw rect _ state =
+presentADraw :: Rect -> Bool -> WState -> Graphic
+presentADraw rect _ state =
   let graphics = map (flip (uncurry draw) rect) state
   in  foldr overGraphic nullGraphic graphics
 
 -- This is the widget used to present the simulation.
-wWidget :: UISF WState ()
-wWidget = mkWidget [] wLayout wCompute wDraw
+presentA :: UISF WState ()
+presentA = mkWidget [] presentALayout presentACompute presentADraw
 
-updateST :: S.StateVar SimST -> IO (S.StateVar SimST, WState)
-updateST st = do
+uisfUpdateST :: S.StateVar SimST -> IO (S.StateVar SimST, WState)
+uisfUpdateST st = do
   advance st
   st' <- S.get st
   let objs = M.keys $ stObjects st'
@@ -227,24 +241,28 @@ updateST st = do
   positions <- mapM f objs
   return (st, zip objs positions)
 
-sWidget :: UISF (S.StateVar SimST) (S.StateVar SimST, WState)
-sWidget = uisfPipe updateST
+simulationA :: UISF (S.StateVar SimST) (S.StateVar SimST, WState)
+simulationA = uisfPipe uisfUpdateST
 
-addBallWidget :: UISF (SEvent BallDef, S.StateVar SimST) (S.StateVar SimST)
-addBallWidget = uisfPipe (uncurry addBall)
+addBallA :: UISF (SEvent BallDef, S.StateVar SimST) (S.StateVar SimST)
+addBallA = uisfPipe (uncurry uisfAddBall)
 
 parserSelect :: [(a, String)] -> a -> a
 parserSelect (r:_) _ = fst r
 parserSelect _ def = def
 
-addBallButton :: UISF () (SEvent BallDef)
-addBallButton = leftRight $ proc _ -> do
-  masstext <- label "Mass" >>> textboxE "1.0" -< Nothing
-  momenttext <- label "M.Inertia" >>> textboxE "5.0" -< Nothing
-  xtext <- label "x" >>> textboxE "400" -< Nothing
-  ytext <- label "y" >>> textboxE "800" -< Nothing
-  elatext <- label "Elasticity" >>> textboxE "0.9" -< Nothing
-  radiustext <- label "Radius" >>> textboxE "10" -< Nothing
+uisfShouldAddBall :: (SEvent Bool, BallDef) -> SEvent BallDef
+uisfShouldAddBall (Just True, bd) = Just bd
+uisfShouldAddBall _ = Nothing
+
+addBallBtnA :: UISF () (SEvent BallDef)
+addBallBtnA = leftRight $ proc _ -> do
+  masstext   <- label "Mass" >>> textboxE "1.0"       -< Nothing
+  momenttext <- label "M.Inertia" >>> textboxE "5.0"  -< Nothing
+  xtext      <- label "x" >>> textboxE "400"          -< Nothing
+  ytext      <- label "y" >>> textboxE "800"          -< Nothing
+  elatext    <- label "Elasticity" >>> textboxE "0.9" -< Nothing
+  radiustext <- label "Radius" >>> textboxE "10"      -< Nothing
 
   let mass   = flip parserSelect 1.0 $ reads masstext :: Double
   let moment = flip parserSelect 5.0 $ reads momenttext :: Double
@@ -253,42 +271,39 @@ addBallButton = leftRight $ proc _ -> do
   let ela    = flip parserSelect 1.0 $ reads elatext :: Double
   let radius = flip parserSelect 10 $ reads radiustext :: Double
 
-  clicked <- button "AddBall" -< ()
-  clickchange <- unique -< clicked
   let balldef = BallDef (x|+|y) radius ela mass moment
-  arr shouldAddBall -< (clickchange, balldef)
 
-shouldAddBall :: (SEvent Bool, BallDef) -> SEvent BallDef
-shouldAddBall (Just True, bd) = Just bd
-shouldAddBall _ = Nothing
+  clicked               <- button "AddBall" -< ()
+  clickchange           <- unique           -< clicked
+  arr uisfShouldAddBall                     -< (clickchange, balldef)
 
-extractCollisionWidget :: UISF (S.StateVar SimST) [Collision]
-extractCollisionWidget = uisfPipe extractCollision
+collisionsA :: UISF (S.StateVar SimST) [Collision]
+collisionsA = uisfPipe extractCollision
 
-print' :: (Show a) => Maybe a -> IO ()
-print' (Just s) = print s
-print' Nothing = return ()
-
-interpolate :: Double -> Double -> Double -> Double
-interpolate max val range = val * (range / max)
 
 collision2midi :: Collision -> MidiMessage
 collision2midi (H.Vector x y, velocity) = ANote ((round $ interpolate 1200 x 16) `mod` 16)
                                                 ((round $ interpolate 800 y 127) `mod` 127)
                                                 ((round $ interpolate 500 velocity 127) `mod` 127)
                                                 (1.0)
+  -- Interpolate a val bwteen [0, max] to a value in [0, range]
+  where interpolate max val range = val * (range / max)
+
+uisfPrint :: (Show a) => Maybe a -> IO ()
+uisfPrint (Just s) = print s
+uisfPrint Nothing = return ()
 
 present :: S.StateVar SimST -> UISF () ()
 present st = proc _ -> do
-  devid <- selectOutput -< ()
-  balldef <- addBallButton -< ()
-  rec st1 <- addBallWidget <<< delay (Nothing, st) -< (balldef, st')
-      (st', wstate) <- sWidget -< st1
-  collisions <- extractCollisionWidget -< st1
-  collisionsuniq <- unique -< collisions
-  _ <- uisfSink print' -< collisionsuniq
-  _ <- midiOut -< (devid, fmap (map collision2midi) collisionsuniq)
-  wWidget -< wstate
+  devid              <- selectOutput                     -< ()
+  balldef            <- addBallBtnA                      -< ()
+  rec st1            <- addBallA <<< delay (Nothing, st) -< (balldef, st')
+      (st', wstate)  <- simulationA                      -< st1
+  collisions         <- collisionsA                      -< st1
+  collisionsuniq     <- unique                           -< collisions
+  _                  <- uisfSink uisfPrint               -< collisionsuniq
+  _                  <- midiOut                          -< (devid, fmap (map collision2midi) collisionsuniq)
+  presentA                                               -< wstate
   
 main :: IO ()
 main = do st <- newSimST worldSize
