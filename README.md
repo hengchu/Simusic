@@ -9,7 +9,7 @@ For some reason the 5.x version of Chipmunk would crash when I use UISF with it.
 Then you can run
 
 ```
-cabal build --install-denepdencies
+cabal install --dependencies-only
 cabal configure
 cabal build
 ./dist/build/simulation/simulation
