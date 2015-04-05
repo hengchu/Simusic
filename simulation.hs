@@ -91,6 +91,13 @@ newSimST (w, h) = do space <- H.newSpace
 destroySimST :: SimST -> IO ()
 destroySimST st = H.freeSpace $ stSpace st
 
+class ObjectType a where
+  mass :: a -> H.Mass
+  moment :: a -> H.Moment
+  pos :: a -> H.Position
+  ela :: a -> H.Elasticity
+  shape :: a -> H.ShapeType
+
 -- Specification of a ball object
 data BallDef = BallDef {ballPos::H.Position
                        ,ballRadius::H.Distance
@@ -99,31 +106,56 @@ data BallDef = BallDef {ballPos::H.Position
                        ,ballMoment::H.Moment
                        }
 
--- Adds a ball given a BallDef to the simST
-addBall :: BallDef -> S.StateVar SimST -> IO (S.StateVar SimST)
-addBall (BallDef pos radius elasticity mass minertia) st = do
+instance ObjectType BallDef where
+  mass = ballMass
+  moment = ballMoment
+  pos = ballPos
+  ela = ballElasticity
+  shape (BallDef {ballRadius=radius}) = H.Circle radius
+
+data SquareDef = SquareDef {squarePos::H.Position
+                           ,squareSideLength::H.Distance
+                           ,squareElasticity::H.Elasticity
+                           ,squareMass::H.Mass
+                           ,squareMoment::H.Moment}
+
+instance ObjectType SquareDef where
+  mass = squareMass
+  moment = squareMoment
+  pos = squarePos
+  ela = squareElasticity
+  shape (SquareDef {squareSideLength=sidelength}) = 
+    let sidelen2 = sidelength / 2
+        vertices = [ (H.Vector (-sidelen2) (-sidelen2))
+                   , (H.Vector (-sidelen2) sidelen2)
+                   , (H.Vector sidelen2 sidelen2)
+                   , (H.Vector sidelen2 (-sidelen2))]
+    in  H.Polygon vertices
+
+addObj :: (ObjectType a) => a -> S.StateVar SimST -> IO ()
+addObj def st = do
   st' <- S.get st
-  ball <- H.newBody mass minertia
-  let ballshapetype = (H.Circle radius)
-  ballshape <- H.newShape ball ballshapetype 0
-  H.elasticity ballshape S.$= elasticity
-  H.position ball S.$= pos
-  H.spaceAdd (stSpace st') ball
-  H.spaceAdd (stSpace st') ballshape
-  
+  body <- H.newBody (mass def) (moment def)
+  let shapetype = shape def
+  shp <- H.newShape body shapetype 0
+  H.elasticity shp S.$= ela def
+  H.position body S.$= pos def
+
+  H.spaceAdd (stSpace st') body
+  H.spaceAdd (stSpace st') shp
+
   let objs = stObjects st'
-  let ballobj = O ball [(ballshape, ballshapetype)]
-  let remove = do H.spaceRemove (stSpace st') ball
-                  H.spaceRemove (stSpace st') ballshape
-  let objs' = M.insert ballobj remove objs
+  let bodyobj = O body [(shp, shapetype)]
+  let remote = do H.spaceRemove (stSpace st') body
+                  H.spaceRemove (stSpace st') shp
+  let objs' = M.insert bodyobj remote objs
 
   st S.$= st'{stObjects=objs'}
-  return st
 
 -- Decorated function for UISF
-uisfAddBall :: SEvent BallDef -> S.StateVar SimST -> IO (S.StateVar SimST)
-uisfAddBall (Just bd) st = addBall bd st
-uisfAddBall _ st = return st
+uisfAddObj :: (ObjectType a) => SEvent a -> S.StateVar SimST -> IO ()
+uisfAddObj (Just def) st = addObj def st
+uisfAddObj _ _ = return ()
 
 extractCollision :: S.StateVar SimST -> IO [Collision]
 extractCollision st = do
@@ -211,7 +243,9 @@ instance Drawable Object where
                                     e = convCoord (w, h) (round (x+ex), round (y+ey))
                                 in FRP.UISF.SOE.line s e
                   H.Polygon vertices ->
-                                undefined
+                                let vertices' = map (+ (H.Vector x y)) vertices
+                                    verticesUISF = map (\(H.Vector x y) -> convCoord (w, h) (round x, round y)) vertices'
+                                in  withColor' (rgba 100 100 100 80) $ polygon verticesUISF
             in  graphic
 
 -- Position for each object in Hipmunk coordinates
@@ -232,20 +266,20 @@ presentADraw rect _ state =
 presentA :: UISF WState ()
 presentA = mkWidget [] presentALayout presentACompute presentADraw
 
-uisfUpdateST :: S.StateVar SimST -> IO (S.StateVar SimST, WState)
+uisfUpdateST :: S.StateVar SimST -> IO WState
 uisfUpdateST st = do
   advance st
   st' <- S.get st
   let objs = M.keys $ stObjects st'
   let f (O b _) = S.get $ H.position b
   positions <- mapM f objs
-  return (st, zip objs positions)
+  return $ zip objs positions
 
-simulationA :: UISF (S.StateVar SimST) (S.StateVar SimST, WState)
+simulationA :: UISF (S.StateVar SimST) WState
 simulationA = uisfPipe uisfUpdateST
 
-addBallA :: UISF (SEvent BallDef, S.StateVar SimST) (S.StateVar SimST)
-addBallA = uisfPipe (uncurry uisfAddBall)
+addObjA :: (ObjectType a) => UISF (SEvent a, S.StateVar SimST) ()
+addObjA = uisfPipe (uncurry uisfAddObj)
 
 parserSelect :: [(a, String)] -> a -> a
 parserSelect (r:_) _ = fst r
@@ -273,9 +307,31 @@ addBallBtnA = leftRight $ proc _ -> do
 
   let balldef = BallDef (x|+|y) radius ela mass moment
 
-  clicked               <- button "AddBall" -< ()
-  clickchange           <- unique           -< clicked
-  arr uisfShouldAddBall                     -< (clickchange, balldef)
+  click      <- button "AddBall" -< ()
+  clicked    <- edge             -< click
+  returnA                        -< fmap (const balldef) clicked
+
+addSquareBtnA :: UISF () (SEvent SquareDef)
+addSquareBtnA = leftRight $ proc _ -> do
+  masstext   <- label "Mass" >>> textboxE "1.0"       -< Nothing
+  momenttext <- label "M.Inertia" >>> textboxE "5.0"  -< Nothing
+  xtext      <- label "x" >>> textboxE "400"          -< Nothing
+  ytext      <- label "y" >>> textboxE "800"          -< Nothing
+  elatext    <- label "Elasticity" >>> textboxE "0.9" -< Nothing
+  sidetext   <- label "Side" >>> textboxE "10"        -< Nothing
+  
+  let mass   = flip parserSelect 1.0 $ reads masstext :: Double
+  let moment = flip parserSelect 5.0 $ reads momenttext :: Double
+  let x      = flip parserSelect 400 $ reads xtext :: Double
+  let y      = flip parserSelect 800 $ reads ytext :: Double
+  let ela    = flip parserSelect 1.0 $ reads elatext :: Double
+  let side   = flip parserSelect 10 $ reads sidetext :: Double
+
+  let squaredef = SquareDef (x|+|y) side ela mass moment
+
+  click   <- button "AddSquare" -< ()
+  clicked <- edge               -< click
+  returnA                       -< fmap (const squaredef) clicked
 
 collisionsA :: UISF (S.StateVar SimST) [Collision]
 collisionsA = uisfPipe extractCollision
@@ -296,17 +352,20 @@ uisfPrint Nothing = return ()
 present :: S.StateVar SimST -> UISF () ()
 present st = proc _ -> do
   devid              <- selectOutput                     -< ()
+  squaredef          <- addSquareBtnA                    -< ()
   balldef            <- addBallBtnA                      -< ()
-  rec st1            <- addBallA <<< delay (Nothing, st) -< (balldef, st')
-      (st', wstate)  <- simulationA                      -< st1
-  collisions         <- collisionsA                      -< st1
+  _                  <- addObjA <<< delay (Nothing, st)  -< (balldef, st)
+  _                  <- addObjA <<< delay (Nothing, st)  -< (squaredef, st)
+  wstate             <- simulationA                      -< st
+  collisions         <- collisionsA                      -< st
   collisionsuniq     <- unique                           -< collisions
-  _                  <- uisfSink uisfPrint               -< collisionsuniq
   _                  <- midiOut                          -< (devid, fmap (map collision2midi) collisionsuniq)
   presentA                                               -< wstate
   
 main :: IO ()
 main = do st <- newSimST worldSize
           stref <- newIORef st
-          let sst = S.makeStateVar (readIORef stref) (writeIORef stref)
-          runMUI defaultUIParams{uiSize=worldSize} (present sst)
+          let sst          = S.makeStateVar (readIORef stref) (writeIORef stref)
+          let defaultClose = uiClose defaultUIParams
+          let myClose      = destroySimST st >> defaultClose
+          runMUI defaultUIParams{uiSize=worldSize, uiClose=myClose} (present sst)
