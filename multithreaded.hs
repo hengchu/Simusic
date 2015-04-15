@@ -361,5 +361,6 @@ main :: IO ()
 main = do
   wqueue <- newTBQueueIO 40
   pqueue <- newTBQueueIO 40
-  threadid <- forkOS $ simulation wqueue pqueue
+  setNumCapabilities 2
+  threadid <- forkOn 2 $ simulation wqueue pqueue
   runMUI defaultUIParams{uiSize=worldSize, uiClose=killThread threadid} $ present wqueue pqueue
